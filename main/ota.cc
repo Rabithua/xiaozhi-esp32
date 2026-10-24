@@ -236,6 +236,13 @@ bool Ota::CheckVersion() {
         ESP_LOGW(TAG, "No firmware section found!");
     }
 
+#ifndef CONFIG_ENABLE_OTA_UPGRADE
+    // This request also obtains activation and connection settings. Keep it,
+    // but ignore firmware offers, including the server's force flag.
+    has_new_version_ = false;
+    ESP_LOGI(TAG, "Server-provided firmware upgrades are disabled");
+#endif
+
     cJSON_Delete(root);
     return true;
 }
@@ -371,8 +378,13 @@ bool Ota::Upgrade(const std::string& firmware_url) {
 }
 
 bool Ota::StartUpgrade(std::function<void(int progress, size_t speed)> callback) {
+#ifndef CONFIG_ENABLE_OTA_UPGRADE
+    ESP_LOGW(TAG, "Firmware download blocked by local configuration");
+    return false;
+#else
     upgrade_callback_ = callback;
     return Upgrade(firmware_url_);
+#endif
 }
 
 std::vector<int> Ota::ParseVersion(const std::string& version) {

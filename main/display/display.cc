@@ -20,8 +20,10 @@ Display::Display() {
         .callback = [](void *arg) {
             Display *display = static_cast<Display*>(arg);
             DisplayLockGuard lock(display);
-            lv_obj_add_flag(display->notification_label_, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_remove_flag(display->status_label_, LV_OBJ_FLAG_HIDDEN);
+            if (display->notification_label_)
+                lv_obj_add_flag(display->notification_label_, LV_OBJ_FLAG_HIDDEN);
+            if (display->status_label_)
+                lv_obj_remove_flag(display->status_label_, LV_OBJ_FLAG_HIDDEN);
         },
         .arg = this,
         .dispatch_method = ESP_TIMER_TASK,

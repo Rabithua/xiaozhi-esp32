@@ -9,6 +9,12 @@
 #include <string>
 #include <chrono>
 
+// Presentation states are independent of the audio/network state machine.
+enum class DisplayUiState {
+    Idle, Listening, Thinking, Speaking, WifiConfiguring, Connecting, Offline,
+    Upgrading, WaitingActivation
+};
+
 struct DisplayFonts {
     const lv_font_t* text_font = nullptr;
     const lv_font_t* icon_font = nullptr;
@@ -31,6 +37,8 @@ public:
     virtual std::string GetTheme() { return current_theme_name_; }
     virtual void UpdateStatusBar(bool update_all = false);
     virtual void SetPowerSaveMode(bool on);
+    virtual void SetUiState(DisplayUiState state) {}
+    virtual void SetUpgradeProgress(int progress) {}
 
     inline int width() const { return width_; }
     inline int height() const { return height_; }

@@ -6,6 +6,26 @@ config OTA_URL
     help
         The application will access this URL to check for new firmwares and server address.
 
+config ENABLE_OTA_UPGRADE
+    bool "Allow server-provided firmware upgrades"
+    default n if BOARD_TYPE_ATK_DNESP32S3_BOX
+    default y
+    help
+        Allow downloading and installing firmware offered by the OTA server,
+        including offers marked as forced upgrades. Disabled by default on
+        the BOX to retain its customized firmware.
+        Activation, server configuration and time synchronization still work
+        when disabled. Manual USB flashing is unaffected.
+
+config ENABLE_LOCAL_OTA
+    bool "Allow authenticated local development OTA"
+    depends on BOARD_TYPE_ATK_DNESP32S3_BOX
+    default y
+    help
+        Accept manually uploaded BOX application images on local port 8080.
+        Uses a device pairing key and the inactive application slot. This is
+        independent of server-provided updates and preserves existing settings.
+
 
 choice
     prompt "Default Language"

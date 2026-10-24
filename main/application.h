@@ -10,6 +10,7 @@
 #include <mutex>
 #include <deque>
 #include <memory>
+#include <atomic>
 
 #include "protocol.h"
 #include "ota.h"
@@ -47,6 +48,11 @@ public:
     DeviceState GetDeviceState() const { return device_state_; }
     bool IsVoiceDetected() const { return audio_service_.IsVoiceDetected(); }
     void Schedule(std::function<void()> callback);
+    // These callbacks run on MainEventLoop; HTTP work stays on its own task.
+    void RequestLocalUpgrade(std::function<void(bool)> ready);
+    void ReportLocalUpgradeProgress(int progress);
+    void FinishLocalUpgrade(bool success, std::string reason);
+    bool IsLocalUpgradeActive() const { return local_ota_active_.load(); }
     void SetDeviceState(DeviceState state);
     void Alert(const char* status, const char* message, const char* emotion = "", const std::string_view& sound = "");
     void DismissAlert();
@@ -77,6 +83,10 @@ private:
     AecMode aec_mode_ = kAecOff;
     std::string last_error_message_;
     AudioService audio_service_;
+
+    std::atomic<bool> local_ota_active_{false};
+    std::atomic<bool> application_ready_{false};
+    bool local_ota_boot_validated_ = false; // MainEventLoop owns this flag.
 
     bool has_server_time_ = false;
     bool aborted_ = false;

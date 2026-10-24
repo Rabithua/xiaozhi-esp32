@@ -35,6 +35,7 @@ std::string WifiBoard::GetBoardType() {
 void WifiBoard::EnterWifiConfigMode() {
     auto& application = Application::GetInstance();
     application.SetDeviceState(kDeviceStateWifiConfiguring);
+    GetDisplay()->SetUiState(DisplayUiState::WifiConfiguring);
 
     auto& wifi_ap = WifiConfigurationAp::GetInstance();
     wifi_ap.SetLanguage(Lang::CODE);
@@ -87,10 +88,18 @@ void WifiBoard::StartNetwork() {
     auto& wifi_station = WifiStation::GetInstance();
     wifi_station.OnScanBegin([this]() {
         auto display = Board::GetInstance().GetDisplay();
+        const auto state = Application::GetInstance().GetDeviceState();
+        if (state != kDeviceStateActivating && state != kDeviceStateUpgrading && state != kDeviceStateWifiConfiguring) {
+            display->SetUiState(DisplayUiState::Connecting);
+        }
         display->ShowNotification(Lang::Strings::SCANNING_WIFI, 30000);
     });
     wifi_station.OnConnect([this](const std::string& ssid) {
         auto display = Board::GetInstance().GetDisplay();
+        const auto state = Application::GetInstance().GetDeviceState();
+        if (state != kDeviceStateActivating && state != kDeviceStateUpgrading && state != kDeviceStateWifiConfiguring) {
+            display->SetUiState(DisplayUiState::Connecting);
+        }
         std::string notification = Lang::Strings::CONNECT_TO;
         notification += ssid;
         notification += "...";
@@ -100,6 +109,37 @@ void WifiBoard::StartNetwork() {
         auto display = Board::GetInstance().GetDisplay();
         std::string notification = Lang::Strings::CONNECTED_TO;
         notification += ssid;
+        // Reconnection should resume the current application activity. During
+        // startup the next step is still a service connection. Activating also
+        // covers genuine activation, so leave that explicitly selected UI alone.
+        switch (Application::GetInstance().GetDeviceState()) {
+            case kDeviceStateUnknown:
+            case kDeviceStateIdle:
+                display->SetUiState(DisplayUiState::Idle);
+                break;
+            case kDeviceStateListening:
+            case kDeviceStateAudioTesting:
+                display->SetUiState(DisplayUiState::Listening);
+                break;
+            case kDeviceStateSpeaking:
+                display->SetUiState(DisplayUiState::Speaking);
+                break;
+            case kDeviceStateWifiConfiguring:
+                display->SetUiState(DisplayUiState::WifiConfiguring);
+                break;
+            case kDeviceStateUpgrading:
+                display->SetUiState(DisplayUiState::Upgrading);
+                break;
+            case kDeviceStateFatalError:
+                display->SetUiState(DisplayUiState::Offline);
+                break;
+            case kDeviceStateStarting:
+            case kDeviceStateConnecting:
+                display->SetUiState(DisplayUiState::Connecting);
+                break;
+            case kDeviceStateActivating:
+                break;
+        }
         display->ShowNotification(notification.c_str(), 30000);
     });
     wifi_station.Start();

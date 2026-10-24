@@ -28,6 +28,16 @@ set(SOURCES "audio/audio_codec.cc"
 
 set(INCLUDE_DIRS "." "display" "audio" "protocols")
 
+if(CONFIG_BOARD_TYPE_ATK_DNESP32S3_BOX)
+    list(APPEND SOURCES "display/box_face_display.cc"
+                        "display/face/large_face.cc"
+                        "display/face/face_screen.cc")
+endif()
+
+if(CONFIG_ENABLE_LOCAL_OTA)
+    list(APPEND SOURCES "local_ota.cc")
+endif()
+
 # 添加板级公共文件
 file(GLOB BOARD_COMMON_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/boards/common/*.cc)
 list(APPEND SOURCES ${BOARD_COMMON_SOURCES})

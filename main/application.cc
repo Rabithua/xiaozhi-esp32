@@ -7,6 +7,10 @@
 #include "websocket_protocol.h"
 #include "assets/lang_config.h"
 #include "mcp_server.h"
+#if CONFIG_ENABLE_LOCAL_OTA
+#include "local_ota.h"
+#include <esp_ota_ops.h>
+#endif
 
 #include <cstring>
 #include <esp_log.h>
@@ -76,11 +80,15 @@ void Application::CheckNewVersion(Ota& ota) {
     while (true) {
         SetDeviceState(kDeviceStateActivating);
         auto display = board.GetDisplay();
+        // Activating also covers version discovery; only the later activation
+        // branch should ask the user to activate the device.
+        display->SetUiState(DisplayUiState::Connecting);
         display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);
 
         if (!ota.CheckVersion()) {
             retry_count++;
             if (retry_count >= MAX_RETRY) {
+                display->SetUiState(DisplayUiState::Offline);
                 ESP_LOGE(TAG, "Too many retries, exit version check");
                 return;
             }
@@ -88,6 +96,7 @@ void Application::CheckNewVersion(Ota& ota) {
             char buffer[256];
             snprintf(buffer, sizeof(buffer), Lang::Strings::CHECK_NEW_VERSION_FAILED, retry_delay, ota.GetCheckVersionUrl().c_str());
             Alert(Lang::Strings::ERROR, buffer, "cloud_slash", Lang::Sounds::OGG_EXCLAMATION);
+            display->SetUiState(DisplayUiState::Offline);
 
             ESP_LOGW(TAG, "Check new version failed, retry in %d seconds (%d/%d)", retry_delay, retry_count, MAX_RETRY);
             for (int i = 0; i < retry_delay; i++) {
@@ -108,6 +117,7 @@ void Application::CheckNewVersion(Ota& ota) {
             vTaskDelay(pdMS_TO_TICKS(3000));
 
             SetDeviceState(kDeviceStateUpgrading);
+            display->SetUpgradeProgress(0);
             
             std::string message = std::string(Lang::Strings::NEW_VERSION) + ota.GetFirmwareVersion();
             display->SetChatMessage("system", message.c_str());
@@ -116,12 +126,21 @@ void Application::CheckNewVersion(Ota& ota) {
             audio_service_.Stop();
             vTaskDelay(pdMS_TO_TICKS(1000));
 
-            bool upgrade_success = ota.StartUpgrade([display](int progress, size_t speed) {
-                std::thread([display, progress, speed]() {
+            bool upgrade_success = ota.StartUpgrade([this, display](int progress, size_t speed) {
+                // MainEventLoop already runs in its own task while this startup
+                // task waits for OTA, so use its existing UI dispatch queue.
+                Schedule([display, progress, speed]() {
+                    display->SetUpgradeProgress(progress);
+#if !CONFIG_BOARD_TYPE_ATK_DNESP32S3_BOX
                     char buffer[32];
-                    snprintf(buffer, sizeof(buffer), "%d%% %uKB/s", progress, speed / 1024);
+                    snprintf(buffer, sizeof(buffer), "%d%% %uKB/s", progress, static_cast<unsigned>(speed / 1024));
                     display->SetChatMessage("system", buffer);
-                }).detach();
+#else
+                    // The BOX renders the numeric progress directly. Late
+                    // progress messages must not replace an error explanation.
+                    (void)speed;
+#endif
+                });
             });
 
             if (!upgrade_success) {
@@ -129,6 +148,7 @@ void Application::CheckNewVersion(Ota& ota) {
                 ESP_LOGE(TAG, "Firmware upgrade failed, restarting audio service and continuing operation...");
                 audio_service_.Start(); // Restart audio service
                 board.SetPowerSaveMode(true); // Restore power save mode
+                display->SetUiState(DisplayUiState::Offline);
                 Alert(Lang::Strings::ERROR, Lang::Strings::UPGRADE_FAILED, "circle_xmark", Lang::Sounds::OGG_EXCLAMATION);
                 vTaskDelay(pdMS_TO_TICKS(3000));
                 // Continue to normal operation (don't break, just fall through)
@@ -143,13 +163,16 @@ void Application::CheckNewVersion(Ota& ota) {
         }
 
         // No new version, mark the current version as valid
+#if !CONFIG_ENABLE_LOCAL_OTA
         ota.MarkCurrentVersionValid();
+#endif
         if (!ota.HasActivationCode() && !ota.HasActivationChallenge()) {
             xEventGroupSetBits(event_group_, MAIN_EVENT_CHECK_NEW_VERSION_DONE);
             // Exit the loop if done checking new version
             break;
         }
 
+        display->SetUiState(DisplayUiState::WaitingActivation);
         display->SetStatus(Lang::Strings::ACTIVATION);
         // Activation code is shown to the user and waiting for the user to input
         if (ota.HasActivationCode()) {
@@ -195,6 +218,16 @@ void Application::ShowActivationCode(const std::string& code, const std::string&
 
     // This sentence uses 9KB of SRAM, so we need to wait for it to finish
     Alert(Lang::Strings::ACTIVATION, message.c_str(), "link", Lang::Sounds::OGG_ACTIVATION);
+#if CONFIG_BOARD_TYPE_ATK_DNESP32S3_BOX
+    if (!code.empty()) {
+        // Keep the actual activation code readable as well as spoken. Do not
+        // pass the combined text through Alert(), which logs its message.
+        std::string activation_text = message;
+        if (!activation_text.empty()) activation_text += "\n";
+        activation_text += code;
+        Board::GetInstance().GetDisplay()->SetChatMessage("system", activation_text.c_str());
+    }
+#endif
 
     for (const auto& digit : code) {
         auto it = std::find_if(digit_sounds.begin(), digit_sounds.end(),
@@ -206,6 +239,7 @@ void Application::ShowActivationCode(const std::string& code, const std::string&
 }
 
 void Application::Alert(const char* status, const char* message, const char* emotion, const std::string_view& sound) {
+    if (IsLocalUpgradeActive()) return;
     ESP_LOGW(TAG, "Alert [%s] %s: %s", emotion, status, message);
     auto display = Board::GetInstance().GetDisplay();
     display->SetStatus(status);
@@ -217,15 +251,18 @@ void Application::Alert(const char* status, const char* message, const char* emo
 }
 
 void Application::DismissAlert() {
+    if (IsLocalUpgradeActive()) return;
     if (device_state_ == kDeviceStateIdle) {
         auto display = Board::GetInstance().GetDisplay();
         display->SetStatus(Lang::Strings::STANDBY);
         display->SetEmotion("neutral");
         display->SetChatMessage("system", "");
+        display->SetUiState(DisplayUiState::Idle);
     }
 }
 
 void Application::ToggleChatState() {
+    if (IsLocalUpgradeActive()) return;
     if (device_state_ == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
         return;
@@ -246,6 +283,7 @@ void Application::ToggleChatState() {
 
     if (device_state_ == kDeviceStateIdle) {
         Schedule([this]() {
+            if (IsLocalUpgradeActive()) return;
             if (!protocol_->IsAudioChannelOpened()) {
                 SetDeviceState(kDeviceStateConnecting);
                 if (!protocol_->OpenAudioChannel()) {
@@ -257,16 +295,19 @@ void Application::ToggleChatState() {
         });
     } else if (device_state_ == kDeviceStateSpeaking) {
         Schedule([this]() {
+            if (IsLocalUpgradeActive()) return;
             AbortSpeaking(kAbortReasonNone);
         });
     } else if (device_state_ == kDeviceStateListening) {
         Schedule([this]() {
+            if (IsLocalUpgradeActive()) return;
             protocol_->CloseAudioChannel();
         });
     }
 }
 
 void Application::StartListening() {
+    if (IsLocalUpgradeActive()) return;
     if (device_state_ == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
         return;
@@ -283,6 +324,7 @@ void Application::StartListening() {
     
     if (device_state_ == kDeviceStateIdle) {
         Schedule([this]() {
+            if (IsLocalUpgradeActive()) return;
             if (!protocol_->IsAudioChannelOpened()) {
                 SetDeviceState(kDeviceStateConnecting);
                 if (!protocol_->OpenAudioChannel()) {
@@ -294,6 +336,7 @@ void Application::StartListening() {
         });
     } else if (device_state_ == kDeviceStateSpeaking) {
         Schedule([this]() {
+            if (IsLocalUpgradeActive()) return;
             AbortSpeaking(kAbortReasonNone);
             SetListeningMode(kListeningModeManualStop);
         });
@@ -301,6 +344,7 @@ void Application::StartListening() {
 }
 
 void Application::StopListening() {
+    if (IsLocalUpgradeActive()) return;
     if (device_state_ == kDeviceStateAudioTesting) {
         audio_service_.EnableAudioTesting(false);
         SetDeviceState(kDeviceStateWifiConfiguring);
@@ -318,6 +362,7 @@ void Application::StopListening() {
     }
 
     Schedule([this]() {
+        if (IsLocalUpgradeActive()) return;
         if (device_state_ == kDeviceStateListening) {
             protocol_->SendStopListening();
             SetDeviceState(kDeviceStateIdle);
@@ -367,11 +412,56 @@ void Application::Start() {
     // Update the status bar immediately to show the network state
     display->UpdateStatusBar(true);
 
+#if CONFIG_ENABLE_LOCAL_OTA
+    // Confirm local health independently of the cloud version/activation API.
+    // StartNetwork has initialized lwIP; a usable HTTP endpoint is part of the
+    // local health check before accepting a newly booted OTA image.
+    if (main_event_loop_task_handle_ && LocalOta::GetInstance().Start()) {
+        Schedule([this]() {
+            const auto running = esp_ota_get_running_partition();
+            if (!running) {
+                ESP_LOGE(TAG, "Local OTA health check: running partition unavailable");
+                return;
+            }
+            if (running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY) {
+                local_ota_boot_validated_ = true;
+                return;
+            }
+            esp_ota_img_states_t state;
+            esp_err_t err = esp_ota_get_state_partition(running, &state);
+            if (err == ESP_ERR_NOT_FOUND) {
+                // Legacy serial installs may have no matching OTA selection
+                // record. There is no pending image to confirm or metadata to
+                // rewrite; the completed local health check still applies.
+                local_ota_boot_validated_ = true;
+                ESP_LOGI(TAG, "Local OTA health ready for legacy serial firmware");
+                return;
+            }
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Local OTA health check: %s", esp_err_to_name(err));
+                return;
+            }
+            if (state == ESP_OTA_IMG_PENDING_VERIFY) {
+                err = esp_ota_mark_app_valid_cancel_rollback();
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "Local OTA boot confirmation failed: %s", esp_err_to_name(err));
+                    return;
+                }
+                ESP_LOGI(TAG, "Local OTA boot health confirmed");
+                local_ota_boot_validated_ = true;
+            } else {
+                local_ota_boot_validated_ = state == ESP_OTA_IMG_VALID || state == ESP_OTA_IMG_UNDEFINED;
+            }
+        });
+    }
+#endif
+
     // Check for new firmware version or get the MQTT broker address
     Ota ota;
     CheckNewVersion(ota);
 
     // Initialize the protocol
+    display->SetUiState(DisplayUiState::Connecting);
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
     // Add MCP common tools before initializing the protocol
@@ -387,19 +477,21 @@ void Application::Start() {
     }
 
     protocol_->OnConnected([this]() {
-        DismissAlert();
+        Schedule([this]() { DismissAlert(); });
     });
 
     protocol_->OnNetworkError([this](const std::string& message) {
+        if (IsLocalUpgradeActive()) return;
         last_error_message_ = message;
         xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
     });
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (device_state_ == kDeviceStateSpeaking) {
+        if (!IsLocalUpgradeActive() && device_state_ == kDeviceStateSpeaking) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
     });
     protocol_->OnAudioChannelOpened([this, codec, &board]() {
+        if (IsLocalUpgradeActive()) return;
         board.SetPowerSaveMode(false);
         if (protocol_->server_sample_rate() != codec->output_sample_rate()) {
             ESP_LOGW(TAG, "Server sample rate %d does not match device output sample rate %d, resampling may cause distortion",
@@ -407,20 +499,23 @@ void Application::Start() {
         }
     });
     protocol_->OnAudioChannelClosed([this, &board]() {
-        board.SetPowerSaveMode(true);
-        Schedule([this]() {
+        Schedule([this, &board]() {
+            if (IsLocalUpgradeActive()) return;
+            board.SetPowerSaveMode(true);
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
             SetDeviceState(kDeviceStateIdle);
         });
     });
     protocol_->OnIncomingJson([this, display](const cJSON* root) {
+        if (IsLocalUpgradeActive()) return;
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
         if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
+                    if (IsLocalUpgradeActive()) return;
                     aborted_ = false;
                     if (device_state_ == kDeviceStateIdle || device_state_ == kDeviceStateListening) {
                         SetDeviceState(kDeviceStateSpeaking);
@@ -428,6 +523,7 @@ void Application::Start() {
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
+                    if (IsLocalUpgradeActive()) return;
                     if (device_state_ == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
@@ -441,6 +537,7 @@ void Application::Start() {
                 if (cJSON_IsString(text)) {
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
                     Schedule([this, display, message = std::string(text->valuestring)]() {
+                        if (IsLocalUpgradeActive()) return;
                         display->SetChatMessage("assistant", message.c_str());
                     });
                 }
@@ -450,13 +547,18 @@ void Application::Start() {
             if (cJSON_IsString(text)) {
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
                 Schedule([this, display, message = std::string(text->valuestring)]() {
+                    if (IsLocalUpgradeActive()) return;
                     display->SetChatMessage("user", message.c_str());
+                    if (device_state_ == kDeviceStateIdle || device_state_ == kDeviceStateListening) {
+                        display->SetUiState(DisplayUiState::Thinking);
+                    }
                 });
             }
         } else if (strcmp(type->valuestring, "llm") == 0) {
             auto emotion = cJSON_GetObjectItem(root, "emotion");
             if (cJSON_IsString(emotion)) {
                 Schedule([this, display, emotion_str = std::string(emotion->valuestring)]() {
+                    if (IsLocalUpgradeActive()) return;
                     display->SetEmotion(emotion_str.c_str());
                 });
             }
@@ -472,6 +574,7 @@ void Application::Start() {
                 if (strcmp(command->valuestring, "reboot") == 0) {
                     // Do a reboot if user requests a OTA update
                     Schedule([this]() {
+                        if (IsLocalUpgradeActive()) return;
                         Reboot();
                     });
                 } else {
@@ -483,7 +586,12 @@ void Application::Start() {
             auto message = cJSON_GetObjectItem(root, "message");
             auto emotion = cJSON_GetObjectItem(root, "emotion");
             if (cJSON_IsString(status) && cJSON_IsString(message) && cJSON_IsString(emotion)) {
-                Alert(status->valuestring, message->valuestring, emotion->valuestring, Lang::Sounds::OGG_VIBRATION);
+                Schedule([this, status_text = std::string(status->valuestring),
+                          message_text = std::string(message->valuestring),
+                          emotion_text = std::string(emotion->valuestring)]() {
+                    if (IsLocalUpgradeActive()) return;
+                    Alert(status_text.c_str(), message_text.c_str(), emotion_text.c_str(), Lang::Sounds::OGG_VIBRATION);
+                });
             } else {
                 ESP_LOGW(TAG, "Alert command requires status, message and emotion");
             }
@@ -493,6 +601,7 @@ void Application::Start() {
             ESP_LOGI(TAG, "Received custom message: %s", cJSON_PrintUnformatted(root));
             if (cJSON_IsObject(payload)) {
                 Schedule([this, display, payload_str = std::string(cJSON_PrintUnformatted(payload))]() {
+                    if (IsLocalUpgradeActive()) return;
                     display->SetChatMessage("system", payload_str.c_str());
                 });
             } else {
@@ -517,6 +626,7 @@ void Application::Start() {
         // Play the success sound to indicate the device is ready
         audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
     }
+    application_ready_.store(true);
 }
 
 // Add a async task to MainLoop
@@ -526,6 +636,57 @@ void Application::Schedule(std::function<void()> callback) {
         main_tasks_.push_back(std::move(callback));
     }
     xEventGroupSetBits(event_group_, MAIN_EVENT_SCHEDULE);
+}
+
+void Application::RequestLocalUpgrade(std::function<void(bool)> ready) {
+    Schedule([this, ready = std::move(ready)]() {
+        bool accepted = false;
+#if CONFIG_ENABLE_LOCAL_OTA
+        if (application_ready_.load() && local_ota_boot_validated_ && !IsLocalUpgradeActive() &&
+            device_state_ == kDeviceStateIdle && protocol_ && !protocol_->IsAudioChannelOpened() &&
+            audio_service_.IsIdle()) {
+            local_ota_active_.store(true);
+            SetDeviceState(kDeviceStateUpgrading);
+            // Keep the three audio worker tasks alive. Stop/Start does not join
+            // the workers and cannot safely recover from a short failed upload.
+            audio_service_.EnableVoiceProcessing(false);
+            audio_service_.EnableWakeWordDetection(false);
+            while (audio_service_.PopPacketFromSendQueue()) {}
+            Board::GetInstance().SetPowerSaveMode(false);
+            Board::GetInstance().GetDisplay()->SetUpgradeProgress(0);
+            accepted = true;
+        }
+#endif
+        if (ready) ready(accepted);
+    });
+}
+
+void Application::ReportLocalUpgradeProgress(int progress) {
+    Schedule([this, progress]() {
+        if (IsLocalUpgradeActive())
+            Board::GetInstance().GetDisplay()->SetUpgradeProgress(progress);
+    });
+}
+
+void Application::FinishLocalUpgrade(bool success, std::string reason) {
+    Schedule([this, success, reason = std::move(reason)]() {
+        if (!IsLocalUpgradeActive()) return;
+        auto& board = Board::GetInstance();
+        auto display = board.GetDisplay();
+        if (success) {
+            display->SetUpgradeProgress(100);
+            // The HTTP task must finish its response before scheduling reboot.
+            return;
+        }
+
+        while (audio_service_.PopPacketFromSendQueue()) {}
+        local_ota_active_.store(false);
+        SetDeviceState(kDeviceStateIdle); // Restores wake-word detection.
+        board.SetPowerSaveMode(true);
+        std::string notification = "本地升级失败";
+        if (!reason.empty()) notification += ": " + reason;
+        display->ShowNotification(notification, 5000);
+    });
 }
 
 // The Main Event Loop controls the chat state and websocket connection
@@ -540,14 +701,16 @@ void Application::MainEventLoop() {
             MAIN_EVENT_CLOCK_TICK |
             MAIN_EVENT_ERROR, pdTRUE, pdFALSE, portMAX_DELAY);
 
-        if (bits & MAIN_EVENT_ERROR) {
+        if ((bits & MAIN_EVENT_ERROR) && !IsLocalUpgradeActive()) {
             SetDeviceState(kDeviceStateIdle);
             Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "circle_xmark", Lang::Sounds::OGG_EXCLAMATION);
+            Board::GetInstance().GetDisplay()->SetUiState(DisplayUiState::Offline);
         }
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
-                if (!protocol_->SendAudio(std::move(packet))) {
+                if (IsLocalUpgradeActive()) continue;
+                if (!protocol_ || !protocol_->SendAudio(std::move(packet))) {
                     break;
                 }
             }
@@ -589,6 +752,7 @@ void Application::MainEventLoop() {
 }
 
 void Application::OnWakeWordDetected() {
+    if (IsLocalUpgradeActive()) return;
     if (!protocol_) {
         return;
     }
@@ -627,17 +791,20 @@ void Application::OnWakeWordDetected() {
 }
 
 void Application::AbortSpeaking(AbortReason reason) {
+    if (IsLocalUpgradeActive()) return;
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
     protocol_->SendAbortSpeaking(reason);
 }
 
 void Application::SetListeningMode(ListeningMode mode) {
+    if (IsLocalUpgradeActive()) return;
     listening_mode_ = mode;
     SetDeviceState(kDeviceStateListening);
 }
 
 void Application::SetDeviceState(DeviceState state) {
+    if (IsLocalUpgradeActive() && state != kDeviceStateUpgrading) return;
     if (device_state_ == state) {
         return;
     }
@@ -697,27 +864,66 @@ void Application::SetDeviceState(DeviceState state) {
             // Do nothing
             break;
     }
+
+    // Display-only states do not alter the audio/network state machine. In
+    // particular, Thinking is driven by the STT/TTS exchange rather than a new
+    // DeviceState value.
+    switch (state) {
+        case kDeviceStateUnknown:
+        case kDeviceStateIdle:
+            display->SetUiState(DisplayUiState::Idle);
+            break;
+        case kDeviceStateStarting:
+        case kDeviceStateConnecting:
+        case kDeviceStateActivating:
+            display->SetUiState(DisplayUiState::Connecting);
+            break;
+        case kDeviceStateWifiConfiguring:
+            display->SetUiState(DisplayUiState::WifiConfiguring);
+            break;
+        case kDeviceStateListening:
+        case kDeviceStateAudioTesting:
+            display->SetUiState(DisplayUiState::Listening);
+            break;
+        case kDeviceStateSpeaking:
+            display->SetUiState(DisplayUiState::Speaking);
+            break;
+        case kDeviceStateUpgrading:
+            display->SetUiState(DisplayUiState::Upgrading);
+            break;
+        case kDeviceStateFatalError:
+            display->SetUiState(DisplayUiState::Offline);
+            break;
+    }
 }
 
 void Application::Reboot() {
+    if (IsLocalUpgradeActive()) {
+        ESP_LOGW(TAG, "Deferring unrelated reboot while local OTA is active");
+        return;
+    }
     ESP_LOGI(TAG, "Rebooting...");
     esp_restart();
 }
 
 void Application::WakeWordInvoke(const std::string& wake_word) {
+    if (IsLocalUpgradeActive()) return;
     if (device_state_ == kDeviceStateIdle) {
         ToggleChatState();
         Schedule([this, wake_word]() {
+            if (IsLocalUpgradeActive()) return;
             if (protocol_) {
                 protocol_->SendWakeWordDetected(wake_word); 
             }
         }); 
     } else if (device_state_ == kDeviceStateSpeaking) {
         Schedule([this]() {
+            if (IsLocalUpgradeActive()) return;
             AbortSpeaking(kAbortReasonNone);
         });
     } else if (device_state_ == kDeviceStateListening) {   
         Schedule([this]() {
+            if (IsLocalUpgradeActive()) return;
             if (protocol_) {
                 protocol_->CloseAudioChannel();
             }
@@ -726,6 +932,7 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
 }
 
 bool Application::CanEnterSleepMode() {
+    if (IsLocalUpgradeActive()) return false;
     if (device_state_ != kDeviceStateIdle) {
         return false;
     }
@@ -743,6 +950,7 @@ bool Application::CanEnterSleepMode() {
 }
 
 void Application::SendMcpMessage(const std::string& payload) {
+    if (IsLocalUpgradeActive()) return;
     if (protocol_ == nullptr) {
         return;
     }
@@ -754,14 +962,17 @@ void Application::SendMcpMessage(const std::string& payload) {
     } else {
         ESP_LOGI(TAG, "Send MCP message in sub thread");
         Schedule([this, payload = std::move(payload)]() {
+            if (IsLocalUpgradeActive()) return;
             protocol_->SendMcpMessage(payload);
         });
     }
 }
 
 void Application::SetAecMode(AecMode mode) {
+    if (IsLocalUpgradeActive()) return;
     aec_mode_ = mode;
     Schedule([this]() {
+        if (IsLocalUpgradeActive()) return;
         auto& board = Board::GetInstance();
         auto display = board.GetDisplay();
         switch (aec_mode_) {
@@ -787,5 +998,6 @@ void Application::SetAecMode(AecMode mode) {
 }
 
 void Application::PlaySound(const std::string_view& sound) {
+    if (IsLocalUpgradeActive()) return;
     audio_service_.PlaySound(sound);
 }
