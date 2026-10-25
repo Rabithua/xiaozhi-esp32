@@ -2,6 +2,10 @@
 
 #include "application.h"
 #include "board.h"
+#include "display/display.h"
+#if defined(CONFIG_BOARD_TYPE_ATK_DNESP32S3_BOX)
+#include "boards/atk-dnesp32s3-box/box_lcd_scan.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -16,6 +20,7 @@
 #include <esp_app_desc.h>
 #include <esp_app_format.h>
 #include <esp_http_server.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_ota_ops.h>
 #include <esp_random.h>
@@ -297,6 +302,57 @@ esp_err_t Status(httpd_req_t* request) {
     cJSON_AddStringToObject(object.get(), "device_state", DeviceStateName(application.GetDeviceState()));
     cJSON_AddBoolToObject(object.get(), "updating", Context().uploading.load() || application.IsLocalUpgradeActive());
     cJSON_AddBoolToObject(object.get(), "boot_valid", BootValid());
+    // Authenticated development diagnostics; no serial session/reset required.
+    // DMA completion is measured by the BOX driver, not by HTTP or LVGL submit.
+    auto* display = Board::GetInstance().GetDisplay();
+    const auto refresh = display ? display->GetRefreshStats() : DisplayRefreshStats{};
+    auto* refresh_json = cJSON_AddObjectToObject(object.get(), "display_refresh");
+    if (refresh_json) {
+        cJSON_AddBoolToObject(refresh_json, "available", refresh.available);
+        cJSON_AddBoolToObject(refresh_json, "full_frame", refresh.full_frame);
+        cJSON_AddNumberToObject(refresh_json, "buffer_bytes", refresh.buffer_bytes);
+        cJSON_AddNumberToObject(refresh_json, "completed_frames", refresh.completed_frames);
+        cJSON_AddNumberToObject(refresh_json, "last_dma_us", refresh.last_dma_us);
+        cJSON_AddNumberToObject(refresh_json, "max_dma_us", refresh.max_dma_us);
+        cJSON_AddNumberToObject(refresh_json, "transfer_errors", refresh.transfer_errors);
+        cJSON_AddBoolToObject(refresh_json, "scan_synchronized", refresh.scan_synchronized);
+        cJSON_AddBoolToObject(refresh_json, "native_order", refresh.native_order);
+        cJSON_AddNumberToObject(refresh_json, "sync_timeouts", refresh.sync_timeouts);
+        cJSON_AddNumberToObject(refresh_json, "last_scan_line", refresh.last_scan_line);
+        cJSON_AddNumberToObject(refresh_json, "last_wait_us", refresh.last_wait_us);
+        cJSON_AddNumberToObject(refresh_json, "last_phase_delay_us", refresh.last_phase_delay_us);
+        cJSON_AddNumberToObject(refresh_json, "late_gate_skips", refresh.late_gate_skips);
+    }
+    cJSON_AddNumberToObject(object.get(), "internal_free_bytes", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    cJSON_AddNumberToObject(object.get(), "internal_min_free_bytes", heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+#if defined(CONFIG_BOARD_TYPE_ATK_DNESP32S3_BOX)
+    const auto scan = box_lcd::GetScanProbeResult();
+    auto* scan_json = cJSON_AddObjectToObject(object.get(), "lcd_scan_probe");
+    if (scan_json) {
+        cJSON_AddBoolToObject(scan_json, "attempted", scan.attempted);
+        cJSON_AddBoolToObject(scan_json, "registers_match", scan.registers_match);
+        cJSON_AddBoolToObject(scan_json, "scan_valid", scan.scan_valid);
+        cJSON_AddBoolToObject(scan_json, "pins_restored", scan.pins_restored);
+        cJSON_AddNumberToObject(scan_json, "madctl", scan.madctl);
+        cJSON_AddNumberToObject(scan_json, "colmod", scan.colmod);
+        cJSON_AddNumberToObject(scan_json, "sample_count", scan.sample_count);
+        cJSON_AddNumberToObject(scan_json, "transitions", scan.transitions);
+        cJSON_AddNumberToObject(scan_json, "wraps", scan.wraps);
+        cJSON_AddNumberToObject(scan_json, "min_line", scan.min_line);
+        cJSON_AddNumberToObject(scan_json, "max_line", scan.max_line);
+        cJSON_AddNumberToObject(scan_json, "frame_period_us", scan.frame_period_us);
+        auto* samples = cJSON_AddArrayToObject(scan_json, "samples");
+        if (samples) {
+            for (uint32_t i = 0; i < std::min<uint32_t>(scan.sample_count, scan.samples.size()); ++i) {
+                auto* sample = cJSON_CreateObject();
+                if (!sample) break;
+                cJSON_AddNumberToObject(sample, "us", scan.samples[i].us);
+                cJSON_AddNumberToObject(sample, "line", scan.samples[i].line);
+                cJSON_AddItemToArray(samples, sample);
+            }
+        }
+    }
+#endif
     return SendJson(request, "200 OK", object.get());
 }
 

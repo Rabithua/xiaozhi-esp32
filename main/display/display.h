@@ -8,6 +8,7 @@
 
 #include <string>
 #include <chrono>
+#include <cstdint>
 
 // Presentation states are independent of the audio/network state machine.
 enum class DisplayUiState {
@@ -19,6 +20,25 @@ struct DisplayFonts {
     const lv_font_t* text_font = nullptr;
     const lv_font_t* icon_font = nullptr;
     const lv_font_t* emoji_font = nullptr;
+};
+
+// Optional measurements from a board-specific completed display transfer.
+struct DisplayRefreshStats {
+    bool available = false;
+    bool full_frame = false;
+    // These describe the enabled transfer mode, not a visual acceptance result.
+    bool scan_synchronized = false;
+    bool native_order = false;
+    uint32_t buffer_bytes = 0;
+    uint32_t completed_frames = 0;
+    uint32_t last_dma_us = 0;
+    uint32_t max_dma_us = 0;
+    uint32_t transfer_errors = 0;
+    uint32_t sync_timeouts = 0;
+    uint32_t last_scan_line = 0;
+    uint32_t last_wait_us = 0;
+    uint32_t last_phase_delay_us = 0;
+    uint32_t late_gate_skips = 0;
 };
 
 class Display {
@@ -39,6 +59,7 @@ public:
     virtual void SetPowerSaveMode(bool on);
     virtual void SetUiState(DisplayUiState state) {}
     virtual void SetUpgradeProgress(int progress) {}
+    virtual DisplayRefreshStats GetRefreshStats() { return {}; }
 
     inline int width() const { return width_; }
     inline int height() const { return height_; }

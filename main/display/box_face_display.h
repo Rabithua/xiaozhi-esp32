@@ -26,8 +26,15 @@ public:
     std::string GetTheme() override;
     void SetPowerSaveMode(bool on) override;
     void UpdateStatusBar(bool update_all = false) override;
+    DisplayRefreshStats GetRefreshStats() override;
 
 private:
+    struct RefreshContext;
+    // The port still owns its original small fallback buffers. This full-frame
+    // buffer is separately owned and remains live until the I80 queue is drained.
+    uint8_t* full_frame_buffer_ = nullptr;
+    uint8_t* native_frame_buffer_ = nullptr;
+    RefreshContext* refresh_context_ = nullptr;
     std::unique_ptr<face_ui::FaceScreen> face_screen_;
     DisplayUiState ui_state_ = DisplayUiState::Connecting;
     std::string message_;
@@ -40,4 +47,10 @@ private:
     void ApplyStateLocked(DisplayUiState state);
     void ApplyMessageLocked();
     void ClearMessageLocked();
+    void InitializeFrameRefreshLocked();
+    void InitializeScanRefreshLocked();
+    esp_err_t SetNativeOrientationLocked();
+    static void FlushFrame(lv_display_t* display, const lv_area_t* area, uint8_t* pixels);
+    static bool ColorTransferDone(esp_lcd_panel_io_handle_t panel_io,
+                                  esp_lcd_panel_io_event_data_t* event, void* context);
 };
